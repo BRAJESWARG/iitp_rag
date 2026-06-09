@@ -1,0 +1,264 @@
+"""
+pipeline.py — Main Two-Stage RAG Pipeline Orchestrator
+=======================================================
+This is the central orchestrator that connects all stages:
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │                   TWO-STAGE RAG PIPELINE                       │
+  │                                                                │
+  │  User Query                                                    │
+  │      ↓                                                         │
+  │  ┌──────────────────────────────────────────┐                  │
+  │  │ STAGE 1: HIGH RECALL (Hybrid Search)     │                  │
+  │  │   BM25 (keyword) + Vector (semantic)     │                  │
+  │  │   EnsembleRetriever [50% + 50%]          │                  │
+  │  │   Output: Top 100 Candidate Docs         │                  │
+  │  └──────────────────────────────────────────┘                  │
+  │      ↓ 100 docs                                                │
+  │  ┌──────────────────────────────────────────┐                  │
+  │  │ STAGE 2: HIGH PRECISION (Cross Encoder)  │                  │
+  │  │   score([query, doc]) for all 100 docs   │                  │
+  │  │   Sort descending, keep Top 5            │                  │
+  │  │   Output: Top 5 Refined Docs             │                  │
+  │  └──────────────────────────────────────────┘                  │
+  │      ↓ 5 docs                                                  │
+  │  ┌──────────────────────────────────────────┐                  │
+  │  │ FINAL: LLM CONTEXT WINDOW (Gemini)       │                  │
+  │  │   Build grounded prompt with context     │                  │
+  │  │   Call gemini-1.5-flash API              │                  │
+  │  │   Output: Final Answer                   │                  │
+  │  └──────────────────────────────────────────┘                  │
+  │      ↓                                                         │
+  │  Final Answer (string)                                         │
+  └────────────────────────────────────────────────────────────────┘
+
+Usage:
+    from pipeline import TwoStageRAGPipeline
+    pipeline = TwoStageRAGPipeline(chunks, vector_store)
+    answer = pipeline.run("What is a transformer model?")
+"""
+
+import os
+import sys
+from typing import List, Optional
+
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+
+# Load environment variables from .env BEFORE importing llm module
+# This ensures GOOGLE_API_KEY is available when GeminiLLM initializes
+load_dotenv()
+
+# Import our pipeline stage modules
+from ingest import ingest_documents, load_vector_store
+from retriever import build_hybrid_retriever, hybrid_search
+from reranker import cross_encoder_rerank
+from llm import generate_answer
+
+
+class TwoStageRAGPipeline:
+    """
+    Complete Two-Stage RAG Pipeline.
+
+    Combines hybrid search (Stage 1) + cross encoder reranking (Stage 2)
+    + Gemini LLM generation (Final Stage) into a single callable pipeline.
+
+    Architecture:
+        Query → Hybrid Search (100 docs) → Cross Encoder Rerank (5 docs)
+              → Gemini LLM → Answer
+
+    Attributes:
+        retriever: EnsembleRetriever (BM25 + Vector)
+        chunks: Raw document chunks (used internally by BM25)
+        vector_store: ChromaDB instance for vector retrieval
+    """
+
+    def __init__(
+        self,
+        chunks: List[Document],
+        vector_store,
+        verbose: bool = True,
+    ):
+        """
+        Initialize the pipeline by building all retrieval components.
+
+        Args:
+            chunks: List of document chunks from ingest.py (for BM25).
+            vector_store: ChromaDB vector store instance (for vector search).
+            verbose: If True, print progress messages at each stage.
+        """
+        self.verbose = verbose
+        self.chunks = chunks
+        self.vector_store = vector_store
+
+        print("\n" + "=" * 60)
+        print("INITIALIZING TWO-STAGE RAG PIPELINE")
+        print("=" * 60)
+
+        # Build the hybrid retriever (Stage 1)
+        # This is done once during initialization (not per query)
+        print("\n[Init] Building hybrid retriever (BM25 + Vector)...")
+        self.retriever = build_hybrid_retriever(chunks, vector_store)
+
+        print("\n[Init] Cross Encoder and Gemini LLM will load on first query.")
+        print("\n✓ Pipeline initialized and ready!")
+        print("=" * 60 + "\n")
+
+    def run(self, user_query: str) -> str:
+        """
+        Execute the complete two-stage RAG pipeline for a user query.
+
+        Steps:
+            1. Validate query
+            2. Stage 1: Hybrid search → 100 candidate docs
+            3. Stage 2: Cross encoder reranking → top 5 docs
+            4. Final: Gemini LLM generates grounded answer
+
+        Args:
+            user_query: The user's question as a plain string.
+
+        Returns:
+            Final answer string generated by Gemini based on top-5 docs.
+            Returns an error message string if any stage fails.
+        """
+        # ----------------------------------------------------------
+        # Input Validation
+        # ----------------------------------------------------------
+        if not user_query or not user_query.strip():
+            return "Error: Query cannot be empty. Please enter a question."
+
+        user_query = user_query.strip()
+
+        print("\n" + "─" * 60)
+        print(f"QUERY: {user_query}")
+        print("─" * 60)
+
+        try:
+            # ──────────────────────────────────────────────────────
+            # STEP 1: STAGE 1 — High Recall via Hybrid Search
+            # ──────────────────────────────────────────────────────
+            # Runs BM25 (keyword) + Vector (semantic) search in parallel
+            # Merges results using Reciprocal Rank Fusion
+            # Returns up to 100 deduplicated candidate documents
+            candidates = hybrid_search(self.retriever, user_query)
+
+            if not candidates:
+                return (
+                    "No relevant documents found. "
+                    "Please ensure documents have been ingested using ingest.py."
+                )
+
+            # ──────────────────────────────────────────────────────
+            # STEP 2: STAGE 2 — High Precision via Cross Encoder
+            # ──────────────────────────────────────────────────────
+            # For each of the 100 docs: score = cross_encoder([query, doc])
+            # Sort by score (descending), return top 5
+            top_5_docs = cross_encoder_rerank(user_query, candidates)
+
+            if not top_5_docs:
+                return "Reranking produced no results. Please try a different query."
+
+            # ──────────────────────────────────────────────────────
+            # STEP 3: FINAL — Google Gemini LLM Generation
+            # ──────────────────────────────────────────────────────
+            # Formats top-5 docs into context, builds prompt,
+            # calls gemini-1.5-flash, returns grounded answer
+            print(f"\n[Gemini] Sending to Gemini LLM...")
+            answer = generate_answer(user_query, top_5_docs)
+
+            return answer
+
+        except ValueError as e:
+            # API key errors, configuration issues
+            return f"Configuration Error: {str(e)}"
+        except Exception as e:
+            # Unexpected errors — show for debugging
+            return f"Pipeline Error: {str(e)}\nPlease check logs and try again."
+
+
+# ------------------------------------------------------------------
+# Standalone Pipeline Execution (used by main.py)
+# ------------------------------------------------------------------
+
+def create_pipeline(file_paths: Optional[List[str]] = None) -> TwoStageRAGPipeline:
+    """
+    Create a fully initialized TwoStageRAGPipeline.
+
+    If file_paths are provided, runs the full ingestion pipeline.
+    Otherwise, loads an existing ChromaDB vector store from disk.
+
+    Args:
+        file_paths: Optional list of document paths to ingest.
+                    If None, attempts to load existing ChromaDB.
+
+    Returns:
+        Ready-to-use TwoStageRAGPipeline instance.
+    
+    Raises:
+        FileNotFoundError: If no ChromaDB exists and no file_paths given.
+        ValueError: If GOOGLE_API_KEY is not set.
+    """
+    # Verify API key is configured before building pipeline
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key or api_key == "your_google_api_key_here":
+        raise ValueError(
+            "\n" + "=" * 60 + "\n"
+            "ERROR: GOOGLE_API_KEY not configured!\n"
+            "─" * 60 + "\n"
+            "1. Open the file: two_stage_rag/.env\n"
+            "2. Replace 'your_google_api_key_here' with your actual key\n"
+            "3. Get your free API key from:\n"
+            "   https://aistudio.google.com/app/apikey\n"
+            + "=" * 60
+        )
+
+    if file_paths:
+        # Ingest new documents and build vector store
+        print("\n[Pipeline] Ingesting documents...")
+        chunks = ingest_documents(file_paths)
+
+        # Load the freshly built vector store
+        from ingest import load_vector_store
+        vector_store = load_vector_store()
+    else:
+        # Load existing ChromaDB (if already ingested)
+        print("\n[Pipeline] Loading existing ChromaDB vector store...")
+        from ingest import load_vector_store
+        vector_store = load_vector_store()
+
+        # For BM25, we need the raw chunks from ChromaDB
+        # Reconstruct Document objects from stored data
+        collection = vector_store._collection
+        results = collection.get(include=["documents", "metadatas"])
+
+        chunks = [
+            Document(
+                page_content=text,
+                metadata=meta or {},
+            )
+            for text, meta in zip(
+                results["documents"],
+                results["metadatas"],
+            )
+        ]
+        print(f"  ✓ Loaded {len(chunks)} chunks from existing ChromaDB")
+
+    return TwoStageRAGPipeline(chunks, vector_store)
+
+
+def rag_pipeline(user_query: str, pipeline: TwoStageRAGPipeline) -> str:
+    """
+    Simple wrapper function matching the specification signature.
+
+    Step 1 → hybrid_search(user_query) → 100 docs
+    Step 2 → cross_encoder_rerank(user_query, 100 docs) → 5 docs
+    Step 3 → gemini_llm(user_query, 5 docs) → final answer
+
+    Args:
+        user_query: User's question.
+        pipeline: Initialized TwoStageRAGPipeline instance.
+
+    Returns:
+        Final answer string.
+    """
+    return pipeline.run(user_query)

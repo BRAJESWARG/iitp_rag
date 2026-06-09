@@ -1,0 +1,169 @@
+Transformer Models and Attention Mechanisms
+============================================
+
+Introduction to Transformer Architecture
+-----------------------------------------
+A transformer model is a type of deep learning architecture introduced in the 
+landmark 2017 paper "Attention Is All You Need" by Vaswani et al. from Google 
+Brain. Unlike recurrent neural networks (RNNs) and LSTMs, transformers rely 
+entirely on attention mechanisms to draw global dependencies between input and 
+output, making them highly parallelizable and efficient.
+
+The transformer architecture consists of an encoder-decoder structure, though 
+many modern variants use only the encoder (like BERT) or only the decoder 
+(like GPT). The key innovation is the self-attention mechanism, which allows 
+each token in a sequence to attend to all other tokens simultaneously.
+
+The Attention Mechanism
+------------------------
+The core of the transformer is the scaled dot-product attention:
+
+    Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) * V
+
+Where:
+- Q (Query): Represents what the model is looking for
+- K (Key): Represents what each token offers
+- V (Value): Represents the actual information content
+- d_k: Dimensionality of the key vectors (used for scaling)
+
+The softmax operation converts raw scores into probability distributions,
+ensuring attention weights sum to 1.0 across all positions.
+
+Multi-Head Attention
+---------------------
+Instead of performing a single attention computation, transformers use 
+Multi-Head Attention (MHA), which runs multiple attention heads in parallel:
+
+    MultiHead(Q, K, V) = Concat(head_1, ..., head_h) * W^O
+    where head_i = Attention(Q*W_i^Q, K*W_i^K, V*W_i^V)
+
+Each head can focus on different aspects of relationships between tokens.
+For example, one head might capture syntactic relationships while another
+captures semantic relationships.
+
+Positional Encoding
+--------------------
+Since transformers have no inherent notion of sequence order (unlike RNNs),
+positional encodings are added to the input embeddings to inject position 
+information. The original paper uses sinusoidal positional encodings:
+
+    PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+    PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+Modern models often use learned positional embeddings instead.
+
+Feed-Forward Networks
+----------------------
+Each transformer layer contains a position-wise feed-forward network (FFN)
+applied to each position independently:
+
+    FFN(x) = max(0, xW_1 + b_1)W_2 + b_2
+
+This typically uses ReLU or GELU activation and expands the dimension by 4x
+before projecting back to the model dimension.
+
+Layer Normalization and Residual Connections
+---------------------------------------------
+Transformers use layer normalization (LayerNorm) and residual connections
+(skip connections) after each sub-layer to stabilize training:
+
+    Output = LayerNorm(x + Sublayer(x))
+
+This "Add & Norm" pattern is critical for training deep transformers.
+
+BERT: Bidirectional Encoder Representations from Transformers
+--------------------------------------------------------------
+BERT, introduced by Google in 2018, is an encoder-only transformer model.
+Key characteristics:
+- Pre-trained on two tasks: Masked Language Modeling (MLM) and 
+  Next Sentence Prediction (NSP)
+- Uses bidirectional context (sees both left and right context)
+- Fine-tuned for downstream tasks: classification, NER, QA, etc.
+- BERT-base has 12 layers, 768 hidden units, 12 attention heads (110M params)
+- BERT-large has 24 layers, 1024 hidden units, 16 attention heads (340M params)
+
+GPT: Generative Pre-trained Transformer
+-----------------------------------------
+GPT models, developed by OpenAI, are decoder-only transformer models:
+- Use causal (left-to-right) attention — each token only sees past tokens
+- Pre-trained with next-token prediction (language modeling)
+- GPT-3 has 175 billion parameters across 96 layers
+- GPT-4 uses a mixture-of-experts architecture (architecture details not public)
+- Excellent for text generation, completion, and reasoning tasks
+
+Retrieval-Augmented Generation (RAG)
+--------------------------------------
+RAG combines retrieval systems with language models:
+1. A query is used to retrieve relevant documents from a knowledge base
+2. Retrieved documents are added to the LLM's context window
+3. The LLM generates an answer grounded in the retrieved context
+
+RAG advantages:
+- Reduces hallucination by grounding responses in retrieved facts
+- Allows models to access up-to-date information without retraining
+- Enables source attribution for generated answers
+- More cost-effective than fine-tuning for knowledge updates
+
+Two-Stage Retrieval in RAG
+---------------------------
+Two-stage retrieval improves RAG quality:
+
+Stage 1 (High Recall - Bi-Encoder):
+- Uses lightweight models to quickly retrieve ~100 candidates
+- Bi-encoders embed query and documents independently
+- Fast: can search millions of documents in milliseconds
+
+Stage 2 (High Precision - Cross Encoder):
+- Takes the 100 candidates and reranks using a cross encoder
+- Cross encoders encode query and document TOGETHER for deep interaction
+- Slow but accurate: typically applied to just 100 candidates
+- Returns top 5-10 most relevant documents
+
+BM25: Best Match 25
+--------------------
+BM25 is a classic keyword-based retrieval algorithm:
+- Based on TF-IDF with improvements for document length normalization
+- Particularly good at exact keyword matches (names, technical terms)
+- Still competitive with modern dense retrieval models in many benchmarks
+- Parameter k1 controls term frequency saturation
+- Parameter b controls document length normalization (typically 0.75)
+
+Vector Embeddings and Similarity Search
+-----------------------------------------
+Dense vector embeddings represent text as points in high-dimensional space:
+- Similar texts are close together in vector space (high cosine similarity)
+- all-MiniLM-L6-v2 produces 384-dimensional embeddings
+- ChromaDB stores these embeddings and enables fast ANN (approximate 
+  nearest neighbor) search using HNSW (Hierarchical Navigable Small World) 
+  graph algorithm
+- Cosine similarity is the standard distance metric: cos(θ) = (A·B)/(|A||B|)
+
+Cross Encoders vs Bi-Encoders
+-------------------------------
+Bi-Encoder:
+- Encodes query and document SEPARATELY into fixed-size vectors
+- Query encoding: O(1) at inference (can pre-compute doc embeddings)
+- Allows pre-indexing millions of documents offline
+- Less accurate: ignores word-level interactions between query and document
+
+Cross Encoder:
+- Encodes query and document TOGETHER through joint transformer attention
+- Full token-level interaction between query and document tokens
+- More accurate: captures exact matching, semantic nuances, context
+- Slow: must run fresh for each (query, document) pair
+- Ideal for reranking a small set (e.g., top 100) of pre-retrieved docs
+
+The ms-marco-MiniLM-L-6-v2 model is fine-tuned on the MS MARCO dataset,
+a large-scale dataset of 8.8 million passages paired with human-labeled 
+relevance judgments from real Bing search queries.
+
+Applications of Transformers
+------------------------------
+Modern transformer models power:
+- Large Language Models (LLMs): ChatGPT, Gemini, Claude, LLaMA
+- Code generation: GitHub Copilot, Code Llama, StarCoder
+- Image generation: DALL-E, Stable Diffusion (uses transformer-based VAE)
+- Vision Transformers (ViT): Apply patches of images as "tokens"
+- Multi-modal models: GPT-4V, Gemini Ultra (text + image + audio)
+- Protein structure prediction: AlphaFold2 uses attention mechanisms
+- Drug discovery: Molecular property prediction with transformer models

@@ -1,0 +1,28 @@
+# ---- Secrets / environment ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- RAG / model artifacts (pdf_rag FAISS store) ----
+store/
+*.idx
+*.meta.pkl
+
+# ---- Node ----
+node_modules/
+dist/
+npm-debug.log*
+yarn-error.log*
+
+# ---- OS / editor ----
+.DS_Store
+__MACOSX/
+.vscode/
