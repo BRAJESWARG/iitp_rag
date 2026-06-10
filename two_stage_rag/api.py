@@ -38,10 +38,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Allow all origins for local development (tighten in production)
+# Explicit dev origins. Using "*" together with allow_credentials=True is invalid
+# (browsers reject it) and insecure — list the frontend/proxy origins instead.
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",  # Vite dev server
+    "http://localhost:3000",
+    "http://localhost:3001",  # Node proxy (serves the built UI)
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -261,14 +267,11 @@ async def run_query(request: QueryRequest):
         candidates = hybrid_search(p.retriever, query)
         stage1_count = len(candidates)
 
-        # Stage 2: Cross Encoder Reranking
-        from reranker import cross_encoder_rerank, get_reranker
-        top_docs = cross_encoder_rerank(query, candidates)
-
-        # Compute scores for the top docs
-        reranker = get_reranker()
-        pairs = [[query, doc.page_content] for doc in top_docs]
-        scores = reranker.model.predict(pairs).tolist()
+        # Stage 2: Cross Encoder Reranking (docs + scores in a single pass)
+        from reranker import cross_encoder_rerank_with_scores
+        ranked = cross_encoder_rerank_with_scores(query, candidates)
+        top_docs = [doc for doc, _ in ranked]
+        scores = [score for _, score in ranked]
 
         # Final: Gemini LLM
         from llm import generate_answer, GEMINI_MODEL
@@ -347,8 +350,10 @@ async def websocket_query(websocket: WebSocket):
                 "stage1_candidates": stage1_count
             })
             
-            from reranker import cross_encoder_rerank, get_reranker
-            top_docs = cross_encoder_rerank(query, candidates)
+            from reranker import cross_encoder_rerank_with_scores
+            ranked = cross_encoder_rerank_with_scores(query, candidates)
+            top_docs = [doc for doc, _ in ranked]
+            scores = [score for _, score in ranked]
             stage2_count = len(top_docs)
 
             if not top_docs:
@@ -358,10 +363,6 @@ async def websocket_query(websocket: WebSocket):
                 })
                 continue
 
-            # Compute scores for the top docs
-            reranker = get_reranker()
-            pairs = [[query, doc.page_content] for doc in top_docs]
-            scores = reranker.model.predict(pairs).tolist()
             snippets = [doc.page_content[:200] for doc in top_docs]
 
             # ──────────────────────────────────────────────────────

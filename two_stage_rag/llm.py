@@ -41,7 +41,7 @@ from langchain_core.documents import Document
 # (langchain_google_genai wrapper has compatibility issues with Gemini 2.0+)
 from google import genai
 from google.genai import types
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 
 # ------------------------------------------------------------------
 # Configuration
@@ -51,8 +51,11 @@ from google.genai.errors import ClientError
 GEMINI_MODEL = "gemini-2.5-flash"       # Latest, best free-tier availability
 TEMPERATURE = 0.2                        # Low = factual, deterministic
 MAX_OUTPUT_TOKENS = 1024                 # Maximum response length
-MAX_RETRIES = 3                          # Retry on 429 rate-limit errors
+MAX_RETRIES = 3                          # Retry on transient errors
 RETRY_BACKOFF = [5, 15, 30]             # Seconds to wait between retries
+# Transient HTTP statuses worth retrying: 429 rate-limit + 5xx server errors
+# (e.g. 503 "model is currently experiencing high demand")
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 # ------------------------------------------------------------------
 # Prompt Template
@@ -200,16 +203,17 @@ class GeminiLLM:
                 print(f"  ✓ Answer generated successfully")
                 return answer
 
-            except ClientError as e:
-                # e.code = HTTP status (429 = quota/rate-limit exceeded)
-                # Retry with backoff; re-raise on final attempt or other errors
-                if e.code == 429 and attempt < MAX_RETRIES - 1:
+            except (ClientError, ServerError) as e:
+                # e.code = HTTP status (429 = rate-limit, 5xx = server overload)
+                # Retry transient errors with backoff; re-raise everything else
+                code = getattr(e, "code", None)
+                if code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
                     wait = RETRY_BACKOFF[attempt]
-                    print(f"  [Rate limit 429] Quota exceeded. "
+                    print(f"  [Transient {code}] Gemini unavailable. "
                           f"Retrying in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
                     time.sleep(wait)
                     continue
-                # Non-429 error or final retry — re-raise
+                # Non-retryable error or final attempt — re-raise
                 raise
 
         return "Error: Could not generate answer after retries."
@@ -263,10 +267,11 @@ class GeminiLLM:
                 print(f"  ✓ Answer stream completed successfully")
                 return
 
-            except ClientError as e:
-                if e.code == 429 and attempt < MAX_RETRIES - 1:
+            except (ClientError, ServerError) as e:
+                code = getattr(e, "code", None)
+                if code in RETRYABLE_STATUS and attempt < MAX_RETRIES - 1:
                     wait = RETRY_BACKOFF[attempt]
-                    print(f"  [Rate limit 429] Quota exceeded. "
+                    print(f"  [Transient {code}] Gemini unavailable. "
                           f"Retrying stream in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
                     time.sleep(wait)
                     continue
