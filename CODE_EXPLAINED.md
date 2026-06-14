@@ -112,12 +112,12 @@ A classic TF-IDF-style ranking that rewards exact keyword overlap and normalizes
 - [retriever.py:41](two_stage_rag/retriever.py#L41).
 
 ### Cross-Encoder (reranker)
-Unlike the bi-encoder, it feeds *query + document together* through one transformer for a precise relevance score — accurate but slow, so it's used only on the candidates.
-- Model `cross-encoder/ms-marco-MiniLM-L-6-v2`, top-5 — [reranker.py:41](two_stage_rag/reranker.py#L41).
+Unlike the bi-encoder, it feeds *query + document together* through one transformer for a precise relevance score — accurate but slow, so it's used only on the candidates. It returns docs **and** scores in one pass; an optional `RERANK_MIN_SCORE` drops clearly-irrelevant chunks (keeping ≥1).
+- Model `cross-encoder/ms-marco-MiniLM-L-6-v2`, top-5 — [reranker.py](two_stage_rag/reranker.py).
 
 ### Grounded generation
-The prompt forces the LLM to answer **only** from the retrieved context and to admit when it can't.
-- Prompt template — [llm.py:64](two_stage_rag/llm.py#L64); call — [llm.py:147](two_stage_rag/llm.py#L147) (and streaming at [llm.py:217](two_stage_rag/llm.py#L217)).
+The prompt forces the LLM to answer **only** from the retrieved context and to admit when it can't. If the best reranked score is below `ANSWER_MIN_SCORE` (opt-in), the pipeline returns "I don't know" and **skips the LLM entirely**. Transient Gemini errors (`429` + `5xx`) are retried with backoff.
+- Prompt template + retry — [llm.py](two_stage_rag/llm.py); generation via `generate_answer()` / `generate_answer_stream()`.
 
 ---
 
@@ -136,7 +136,7 @@ flowchart LR
 
 Code: [ingest.py: `ingest_documents()`](two_stage_rag/ingest.py#L143) → `load_documents()` → `split_documents()` → `build_vector_store()`. Returns the raw chunks so [retriever.py](two_stage_rag/retriever.py#L41) can build the BM25 index from them.
 
-> Note: ingestion **adds** to the existing collection (it doesn't replace), so ingesting a second document leaves both in the index.
+> Note: ingestion **appends** by default (both docs stay indexed) — pass `replace=True` / the `/api/ingest` `replace` flag to clear the collection first. After any ingest, BM25 is rebuilt over the **full** collection so keyword search covers every document. Extraction whitespace is normalized on load.
 
 ---
 
@@ -159,8 +159,8 @@ sequenceDiagram
     A->>R: hybrid_search(query)
     R-->>A: ~100 candidates
     A-->>U: {type: stage, stage: stage2_reranking, stage1_candidates}
-    A->>K: cross_encoder_rerank(query, candidates)
-    K-->>A: top 5 docs (+ scores)
+    A->>K: cross_encoder_rerank_with_scores(query, candidates)
+    K-->>A: top 5 (doc, score)
     A-->>U: {type: stage, stage: llm_generating, scores, snippets}
     A->>G: generate_answer_stream(query, top5)
     loop streamed chunks
@@ -175,6 +175,8 @@ Code map:
 - WebSocket handler: [api.py: `websocket_query`](two_stage_rag/api.py#L295) — emits `stage` / `chunk` / `done` / `error` events.
 - Non-streaming path: [api.py: `run_query`](two_stage_rag/api.py#L236).
 - Orchestration (CLI path): [pipeline.py: `TwoStageRAGPipeline.run`](two_stage_rag/pipeline.py#L107).
+- Blocking stages (search / rerank / Gemini) run inside `asyncio.to_thread`, so the event loop stays free and the WebSocket keepalive isn't starved on slow/cold queries.
+- If the top reranked score < `ANSWER_MIN_SCORE`, the handler sends "I don't know" and skips Gemini.
 
 ---
 
@@ -237,11 +239,16 @@ Code: [qa.py](pdf_rag/qa.py#L13) orchestrates [pdf_loader.py](pdf_rag/pdf_loader
 
 ---
 
-## 9. Where to improve (summary)
+## 9. Improvements — done & remaining
 
-See the conversation/notes for detail, but the highest-value changes:
-1. Retry on 5xx (not just 429) in [llm.py](two_stage_rag/llm.py#L266).
-2. Score-threshold filtering in [reranker.py](two_stage_rag/reranker.py#L72) so irrelevant chunks aren't sent to the LLM.
-3. Return rerank scores once (avoid the double cross-encoder pass in [api.py](two_stage_rag/api.py#L266)).
-4. Fix/pin `two_stage_rag/requirements.txt` (missing `google-genai`, `langchain-classic`, `fastapi`, `uvicorn`, `python-multipart`).
-5. Surface real source filenames/pages as citations in the UI.
+**Done** (Tier 1 + Tier 2 — see [IMPROVEMENTS.md](IMPROVEMENTS.md)):
+- ✅ Retry transient 5xx (not just 429) — `llm.py`
+- ✅ `RERANK_MIN_SCORE` threshold + single-pass `rerank_with_scores` — `reranker.py` / `api.py`
+- ✅ `ANSWER_MIN_SCORE` "I don't know" short-circuit — `llm.py` / `pipeline.py` / `api.py`
+- ✅ BM25 over full collection + ingest replace-mode + whitespace normalization — `pipeline.py` / `ingest.py`
+- ✅ Proxy POST-body fix + WS `asyncio.to_thread`; completed `requirements.txt`; Node 20 + Linux JS deps
+
+**Remaining:**
+1. Source citations (filenames/pages) in the UI — needs a React change + `dist` rebuild (now possible on Node 20).
+2. Fix System 1 (`pdf_rag`) for the `openai>=1.0` SDK.
+3. Tier 3: Dockerize, API auth + upload limits, eval harness.

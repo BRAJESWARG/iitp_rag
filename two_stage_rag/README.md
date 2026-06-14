@@ -37,7 +37,7 @@ User Query
 │                                          │
 │   Context: {top_5_docs}                  │
 │   Question: {user_query}                 │
-│   → gemini-1.5-flash API                 │
+│   → gemini-2.5-flash API                 │
 │                                          │
 │   Output: Grounded Final Answer          │
 └──────────────────────────────────────────┘
@@ -190,7 +190,7 @@ Answer:
 
 | Parameter | Value |
 |-----------|-------|
-| Model | `gemini-1.5-flash` |
+| Model | `gemini-2.5-flash` |
 | Temperature | 0.2 (factual, low creativity) |
 | Max tokens | 1024 |
 | Grounding | Context-only, says "I don't know" if not found |

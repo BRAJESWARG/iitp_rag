@@ -1,5 +1,9 @@
 # How to Run the Two-Stage RAG Application
 
+> ⚠️ **These are the original macOS notes** (hardcoded `/Users/brajeswarghosh/...` paths).
+> For the current, verified **Linux** setup — Node 20, CPU Torch, and the dep/lockfile
+> gotchas — use **[../RUN_GUIDE.md](../RUN_GUIDE.md)** instead.
+
 This project consists of three parts that need to be running simultaneously to work end-to-end:
 1. **Python FastAPI Backend** (Handles indexing, embedding, retrieval, reranking, and LLM communication)
 2. **Node.js Express Proxy** (Proxies requests and real-time WebSocket connections)
