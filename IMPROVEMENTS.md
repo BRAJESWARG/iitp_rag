@@ -120,8 +120,44 @@ compatible Vite). The backend already returns scores/snippets to support it.
   where previously it would have indexed only the new doc.
 - ChromaDB restored to the committed sample-only baseline after testing.
 
+## Batch 4 — Tier 3 (production-readiness)
+
+### 12. Eval harness — `eval.py` (new)
+A retrieval-quality test set: fixed `(question → expected keywords)` cases run
+against the live ChromaDB, checking the expected text appears in the top reranked
+docs. Deterministic, no LLM calls (CI-safe); `--answers` also grades Gemini output.
+Exit code 0/1. **Verified:** 6/6 retrieval cases pass on the sample corpus.
+
+### 13. Logging — `api.py`
+Added a timestamped/leveled `logging` config and converted the server's `print()`
+calls to `logging` (`logger.info` / `warning` / `exception`); dropped the now-unused
+`traceback` import.
+
+### 14. API hardening — `api.py`
+- **Optional API-key auth** (`API_KEY` env): when set, `/api/query` + `/api/ingest`
+  (and the WebSocket) require a matching `X-API-Key`; `/api/status` stays open.
+- **Upload limits**: `MAX_UPLOAD_FILES` (default 10) and `MAX_UPLOAD_MB` (default 25)
+  enforced on `/api/ingest` (400 / 413).
+- **Bug fix:** the ingest handler's broad `except Exception` was turning validation
+  errors (size/type) into 500s — now re-raises `HTTPException` unchanged.
+**Verified** via FastAPI `TestClient`: 401 without/with wrong key, passes with key;
+413 over size, 400 too-many/unsupported-type, 401 unauthenticated ingest.
+
+### 15. Dockerize — `Dockerfile.api`, `backend/Dockerfile`, `docker-compose.yml`, `.dockerignore` (new)
+One-command stack: `cd two_stage_rag && docker compose up --build` → open
+http://localhost:3001. `api` (FastAPI, CPU-Torch) + `proxy` (multi-stage: builds the
+React UI, serves it, proxies `/api` to `api:8000`). `compose config` validates;
+a full build needs the Docker daemon running (wasn't available in this sandbox).
+
+### 16. Fix System 1 (`pdf_rag`) for openai>=1.0 — `pdf_rag/embeddings.py`, `pdf_rag/retriever.py`
+Migrated `openai.Embeddings.create` → `client.embeddings.create` and
+`openai.ChatCompletion.create` → `client.chat.completions.create`, using a lazily
+created `OpenAI()` client (import works without `OPENAI_API_KEY`; key needed only at
+call time). **Verified:** compiles + imports under openai 2.41.0. End-to-end run still
+needs a real OpenAI key.
+
 ## Notes
-- New env knobs (both opt-in, set in `.env`): `RERANK_MIN_SCORE`, `ANSWER_MIN_SCORE`.
+- New env knobs (both opt-in, set in `.env`): `RERANK_MIN_SCORE`, `ANSWER_MIN_SCORE`. Tier 3 adds `API_KEY`, `MAX_UPLOAD_FILES`, `MAX_UPLOAD_MB`.
 - After changing Python files, **restart uvicorn** (the server was started without `--reload`) for the running web app to pick them up.
 - The relevance threshold is **opt-in**: set `RERANK_MIN_SCORE` in `.env` (e.g. `RERANK_MIN_SCORE=0`) to enable it.
 - These are behavioural/robustness fixes; the deeper items (source-citation UI, low-relevance short-circuit, ingest replace-mode, Dockerization, fixing System 1's OpenAI SDK) are tracked separately and not in this batch.
