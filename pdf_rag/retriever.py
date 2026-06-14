@@ -1,13 +1,20 @@
-import os
 from typing import Iterable
 
-import openai
+from openai import OpenAI
 
 from .embeddings import get_openai_embedding
 from .vector_store import index_search
 
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Lazy OpenAI client (reads OPENAI_API_KEY on first use)
+_client = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 
 def semantic_search(query: str, chunks: list[str], index, top_k: int = 8, embedding_model: str = "text-embedding-3-large") -> list[tuple[str, float]]:
@@ -28,7 +35,7 @@ def rerank_documents(query: str, documents: Iterable[str], reranker_model: str =
         prompt += f"[{idx}] {doc}\n\n"
     prompt += "\nReturn only valid JSON."
 
-    response = openai.ChatCompletion.create(
+    response = _get_client().chat.completions.create(
         model=reranker_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
@@ -55,7 +62,7 @@ def generate_answer(query: str, top_documents: Iterable[str], answer_model: str 
         prompt += f"[{idx}] {doc}\n\n"
     prompt += "\nAnswer:" 
 
-    response = openai.ChatCompletion.create(
+    response = _get_client().chat.completions.create(
         model=answer_model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
