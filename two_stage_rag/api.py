@@ -14,6 +14,7 @@ Run with:
 
 import os
 import sys
+import asyncio
 import shutil
 import tempfile
 import traceback
@@ -262,20 +263,23 @@ async def run_query(request: QueryRequest):
         p = pipeline_state["pipeline"]
         query = request.query.strip()
 
+        # All three stages are blocking (CPU + network); run them in worker
+        # threads so the asyncio event loop stays responsive under concurrency.
+
         # Stage 1: Hybrid Search
         from retriever import hybrid_search
-        candidates = hybrid_search(p.retriever, query)
+        candidates = await asyncio.to_thread(hybrid_search, p.retriever, query)
         stage1_count = len(candidates)
 
         # Stage 2: Cross Encoder Reranking (docs + scores in a single pass)
         from reranker import cross_encoder_rerank_with_scores
-        ranked = cross_encoder_rerank_with_scores(query, candidates)
+        ranked = await asyncio.to_thread(cross_encoder_rerank_with_scores, query, candidates)
         top_docs = [doc for doc, _ in ranked]
         scores = [score for _, score in ranked]
 
         # Final: Gemini LLM
         from llm import generate_answer, GEMINI_MODEL
-        answer = generate_answer(query, top_docs)
+        answer = await asyncio.to_thread(generate_answer, query, top_docs)
 
         duration_ms = (time.time() - start_time) * 1000
 
@@ -330,8 +334,9 @@ async def websocket_query(websocket: WebSocket):
             await websocket.send_json({"type": "stage", "stage": "stage1_searching"})
             
             from retriever import hybrid_search
-            # Non-blocking search execution
-            candidates = hybrid_search(p.retriever, query)
+            # Run blocking retrieval in a worker thread so the event loop stays
+            # responsive and the WebSocket keepalive isn't starved on slow queries.
+            candidates = await asyncio.to_thread(hybrid_search, p.retriever, query)
             stage1_count = len(candidates)
 
             if not candidates:
@@ -351,7 +356,7 @@ async def websocket_query(websocket: WebSocket):
             })
             
             from reranker import cross_encoder_rerank_with_scores
-            ranked = cross_encoder_rerank_with_scores(query, candidates)
+            ranked = await asyncio.to_thread(cross_encoder_rerank_with_scores, query, candidates)
             top_docs = [doc for doc, _ in ranked]
             scores = [score for _, score in ranked]
             stage2_count = len(top_docs)
@@ -376,10 +381,17 @@ async def websocket_query(websocket: WebSocket):
                 "top_doc_snippets": snippets
             })
 
-            # Stream Gemini answer chunk-by-chunk
+            # Stream Gemini answer chunk-by-chunk. The generator blocks on each
+            # network read, so pull each chunk in a worker thread to keep the
+            # event loop (and WebSocket keepalive) responsive between chunks.
             from llm import generate_answer_stream, GEMINI_MODEL
-            
-            for text_chunk in generate_answer_stream(query, top_docs):
+
+            gen = generate_answer_stream(query, top_docs)
+            _SENTINEL = object()
+            while True:
+                text_chunk = await asyncio.to_thread(next, gen, _SENTINEL)
+                if text_chunk is _SENTINEL:
+                    break
                 await websocket.send_json({
                     "type": "chunk",
                     "text": text_chunk

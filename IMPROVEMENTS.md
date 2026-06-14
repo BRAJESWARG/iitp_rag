@@ -42,6 +42,36 @@ A running record of changes made on the `feature/rag-improvements` branch, why, 
 - `RERANK_MIN_SCORE=0` correctly dropped 2/3 irrelevant (−11) chunks, kept the relevant one.
 - Full CLI query "What is a transformer model?" ran end-to-end in ~13s with a correct grounded answer.
 
+## Batch 2 — Tier 1 bug fixes (found during end-to-end testing)
+
+### 6. Proxy no longer hangs on `POST /api/query` — `backend/src/server.ts`
+**Problem:** `express.json()` / `express.urlencoded()` were mounted *before* the
+`/api` proxy, so they consumed the request body; the proxied POST then reached
+FastAPI with an empty body and hung (`http_code=000`, observed in testing).
+WebSocket and multipart `/api/ingest` were unaffected, which is why the UI worked.
+**Fix:** Mount the body parsers **after** `app.use('/api', apiProxy)` so proxied
+requests keep their raw body stream.
+**Files:** [server.ts](two_stage_rag/backend/src/server.ts)
+
+### 7. WebSocket no longer starves the event loop — `api.py`
+**Problem:** The WS handler ran the blocking pipeline (hybrid search, cross-encoder,
+Gemini streaming) directly in the async coroutine, blocking the event loop. On a
+cold/slow query this tripped strict WS keepalive timeouts (we saw a `1011` ping
+timeout from the Python `websockets` client).
+**Fix:** Wrap each blocking stage in `await asyncio.to_thread(...)`, and pull each
+streamed chunk via `asyncio.to_thread(next, gen, sentinel)`, so the loop stays
+responsive to pings between chunks. Applied to the HTTP `/api/query` path too for
+consistency/concurrency.
+**Files:** [api.py](two_stage_rag/api.py)
+
+## Verification (Batch 2)
+- `py_compile api.py` clean; Node proxy boots with the reordered middleware.
+- **Proxy POST fix:** `POST /api/query` through :3001 now returns `200` in ~3s
+  (was `http_code=000`, hung at 8s before the fix).
+- **WS event-loop fix:** `test_ws.py` with its *default* 20s keepalive completed a
+  **cold** query (12.8s, cross-encoder loading mid-request) with **no `1011`** —
+  the exact scenario that failed before. All 3 stages + streamed answer received.
+
 ## Notes
 - After changing Python files, **restart uvicorn** (the server was started without `--reload`) for the running web app to pick them up.
 - The relevance threshold is **opt-in**: set `RERANK_MIN_SCORE` in `.env` (e.g. `RERANK_MIN_SCORE=0`) to enable it.

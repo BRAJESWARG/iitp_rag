@@ -30,8 +30,9 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// NOTE: body parsers are mounted AFTER the /api proxy (below). If express.json()
+// runs first it consumes the request stream, so proxied POSTs (e.g. /api/query)
+// reach FastAPI with an empty body and the request hangs.
 
 // ──────────────────────────────────────────────────────
 // Health check
@@ -65,6 +66,11 @@ const apiProxy = createProxyMiddleware({
 });
 
 app.use('/api', apiProxy);
+
+// Body parsers for any non-proxied routes — mounted AFTER the proxy so they
+// don't consume the body of proxied /api requests (which would hang POSTs).
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ──────────────────────────────────────────────────────
 // Serve React production build (if it exists)
