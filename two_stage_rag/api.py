@@ -185,7 +185,7 @@ def get_status():
 
 
 @app.post("/api/ingest", response_model=IngestResponse)
-async def ingest_documents(files: List[UploadFile] = File(...)):
+async def ingest_documents(files: List[UploadFile] = File(...), replace: bool = Form(False)):
     """
     Ingest one or more PDF or TXT documents into the RAG system.
     Accepts multipart/form-data with one or more file fields.
@@ -215,21 +215,25 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
         pipeline_state["initializing"] = True
         from pipeline import create_pipeline
 
-        p = create_pipeline(file_paths=saved_paths)
+        p = create_pipeline(file_paths=saved_paths, replace=replace)
         pipeline_state["pipeline"] = p
         pipeline_state["initialized"] = True
         pipeline_state["chunks_count"] = len(p.chunks)
-        pipeline_state["documents_loaded"] = [
-            os.path.basename(path) for path in saved_paths
-        ]
+        # Reflect ALL documents currently in the store, not just this upload
+        loaded = set()
+        for doc in p.chunks:
+            src = doc.metadata.get("source")
+            if src:
+                loaded.add(os.path.basename(src))
+        pipeline_state["documents_loaded"] = sorted(loaded)
         pipeline_state["started_at"] = datetime.now().isoformat()
         pipeline_state["error"] = None
 
         return IngestResponse(
             success=True,
             message=f"Successfully ingested {len(saved_paths)} document(s).",
-            files_ingested=[os.path.basename(p) for p in saved_paths],
-            total_chunks=len(pipeline_state["pipeline"].chunks),
+            files_ingested=[os.path.basename(path) for path in saved_paths],
+            total_chunks=len(p.chunks),
         )
 
     except Exception as e:
@@ -277,9 +281,12 @@ async def run_query(request: QueryRequest):
         top_docs = [doc for doc, _ in ranked]
         scores = [score for _, score in ranked]
 
-        # Final: Gemini LLM
-        from llm import generate_answer, GEMINI_MODEL
-        answer = await asyncio.to_thread(generate_answer, query, top_docs)
+        # Final: Gemini LLM — but skip it if nothing is relevant enough
+        from llm import generate_answer, GEMINI_MODEL, ANSWER_MIN_SCORE, NO_ANSWER_MESSAGE
+        if ANSWER_MIN_SCORE is not None and scores and max(scores) < ANSWER_MIN_SCORE:
+            answer = NO_ANSWER_MESSAGE
+        else:
+            answer = await asyncio.to_thread(generate_answer, query, top_docs)
 
         duration_ms = (time.time() - start_time) * 1000
 
@@ -384,18 +391,22 @@ async def websocket_query(websocket: WebSocket):
             # Stream Gemini answer chunk-by-chunk. The generator blocks on each
             # network read, so pull each chunk in a worker thread to keep the
             # event loop (and WebSocket keepalive) responsive between chunks.
-            from llm import generate_answer_stream, GEMINI_MODEL
+            from llm import generate_answer_stream, GEMINI_MODEL, ANSWER_MIN_SCORE, NO_ANSWER_MESSAGE
 
-            gen = generate_answer_stream(query, top_docs)
-            _SENTINEL = object()
-            while True:
-                text_chunk = await asyncio.to_thread(next, gen, _SENTINEL)
-                if text_chunk is _SENTINEL:
-                    break
-                await websocket.send_json({
-                    "type": "chunk",
-                    "text": text_chunk
-                })
+            if ANSWER_MIN_SCORE is not None and scores and max(scores) < ANSWER_MIN_SCORE:
+                # Nothing relevant enough — skip the LLM and say so.
+                await websocket.send_json({"type": "chunk", "text": NO_ANSWER_MESSAGE})
+            else:
+                gen = generate_answer_stream(query, top_docs)
+                _SENTINEL = object()
+                while True:
+                    text_chunk = await asyncio.to_thread(next, gen, _SENTINEL)
+                    if text_chunk is _SENTINEL:
+                        break
+                    await websocket.send_json({
+                        "type": "chunk",
+                        "text": text_chunk
+                    })
 
             duration_ms = (time.time() - start_time) * 1000
 

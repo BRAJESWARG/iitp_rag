@@ -72,7 +72,56 @@ consistency/concurrency.
   **cold** query (12.8s, cross-encoder loading mid-request) with **no `1011`** —
   the exact scenario that failed before. All 3 stages + streamed answer received.
 
+## Batch 3 — Tier 2 (RAG quality)
+
+### 8. BM25 now indexes the FULL collection after ingest — `pipeline.py`
+**Problem (found in testing):** after an ingest, `create_pipeline` set the BM25
+chunks to the *newly ingested docs only*, so keyword search silently lost every
+previously-ingested document until a server restart (masked by vector search).
+**Fix:** `create_pipeline` always rebuilds chunks from the full persisted
+collection, keeping BM25 and vector retrievers in sync.
+**Files:** [pipeline.py](two_stage_rag/pipeline.py)
+
+### 9. Ingest replace-mode — `pipeline.py`, `ingest.py`, `api.py`
+**Why:** ingestion appends, so re-ingesting mixes old + new docs with no way to
+reset. **Fix:** added `reset_vector_store()` and a `replace` flag
+(`create_pipeline(..., replace=True)`, `POST /api/ingest` form field `replace`)
+that clears the collection before ingesting. `/api/status` `documents_loaded`
+now reflects the full store, not just the last upload.
+**Files:** [ingest.py](two_stage_rag/ingest.py), [pipeline.py](two_stage_rag/pipeline.py), [api.py](two_stage_rag/api.py)
+
+### 10. Low-relevance "I don't know" short-circuit — `llm.py`, `pipeline.py`, `api.py`
+**Why:** when nothing relevant is retrieved, the LLM is still called and may
+grasp at irrelevant chunks. **Fix:** opt-in `ANSWER_MIN_SCORE` (env) — if the top
+reranked score is below it, return `NO_ANSWER_MESSAGE` and skip the LLM call
+(saves cost, avoids hallucination). Applied to CLI, HTTP, and WS paths.
+**Files:** [llm.py](two_stage_rag/llm.py), [pipeline.py](two_stage_rag/pipeline.py), [api.py](two_stage_rag/api.py)
+
+### 11. Whitespace normalization on ingest — `ingest.py`
+**Why:** PDF/DOCX extraction produced doubled spaces (`Acme  Technologies`) and
+stray newlines, which hurts chunking. **Fix:** `_normalize_text()` collapses
+non-breaking spaces, runs of spaces/tabs, and 3+ blank lines on load.
+**Files:** [ingest.py](two_stage_rag/ingest.py)
+
+### NOT done — #3 Source citations in the UI (BLOCKED)
+Showing source filename/page in the chat requires editing the React UI and
+rebuilding `frontend/dist`, but Vite 8 needs Node 20+ and this machine is on
+Node 18. Deferred until Node is upgraded (or the dep is pinned to a Node-18
+compatible Vite). The backend already returns scores/snippets to support it.
+
+## Verification (Batch 3)
+- `py_compile` clean on api/pipeline/reranker/llm/ingest; imports OK.
+- **Normalization:** `'Acme  Technologies\xa0Inc.\n\n\n\nLeave   Policy'` → `'Acme Technologies Inc.\n\nLeave Policy'`.
+- **BM25 full collection:** `create_pipeline(None)` builds BM25 over all 66 chunks.
+- **Short-circuit:** with `ANSWER_MIN_SCORE=1000`, a query returned `NO_ANSWER_MESSAGE`
+  and skipped the LLM (`[Relevance] top score 8.934 < 1000.0 — skipping LLM`).
+- **Replace-mode:** `create_pipeline([zephyr], replace=True)` → collection cleared, 1 chunk.
+- **BM25 fix:** appending `sample2` then → BM25 covers BOTH (`['sample2.txt','zephyr_test.txt']`),
+  where previously it would have indexed only the new doc.
+- ChromaDB restored to the committed sample-only baseline after testing.
+
 ## Notes
+- New env knobs (both opt-in, set in `.env`): `RERANK_MIN_SCORE`, `ANSWER_MIN_SCORE`.
 - After changing Python files, **restart uvicorn** (the server was started without `--reload`) for the running web app to pick them up.
 - The relevance threshold is **opt-in**: set `RERANK_MIN_SCORE` in `.env` (e.g. `RERANK_MIN_SCORE=0`) to enable it.
 - These are behavioural/robustness fixes; the deeper items (source-citation UI, low-relevance short-circuit, ingest replace-mode, Dockerization, fixing System 1's OpenAI SDK) are tracked separately and not in this batch.

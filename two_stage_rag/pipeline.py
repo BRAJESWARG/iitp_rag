@@ -50,10 +50,10 @@ from langchain_core.documents import Document
 load_dotenv()
 
 # Import our pipeline stage modules
-from ingest import ingest_documents, load_vector_store
+from ingest import ingest_documents, load_vector_store, reset_vector_store
 from retriever import build_hybrid_retriever, hybrid_search
-from reranker import cross_encoder_rerank
-from llm import generate_answer
+from reranker import cross_encoder_rerank_with_scores
+from llm import generate_answer, ANSWER_MIN_SCORE, NO_ANSWER_MESSAGE
 
 
 class TwoStageRAGPipeline:
@@ -153,16 +153,25 @@ class TwoStageRAGPipeline:
             # ──────────────────────────────────────────────────────
             # For each of the 100 docs: score = cross_encoder([query, doc])
             # Sort by score (descending), return top 5
-            top_5_docs = cross_encoder_rerank(user_query, candidates)
+            ranked = cross_encoder_rerank_with_scores(user_query, candidates)
+            top_5_docs = [doc for doc, _ in ranked]
 
             if not top_5_docs:
                 return "Reranking produced no results. Please try a different query."
+
+            # If the best match isn't relevant enough, don't risk a hallucinated
+            # answer — say "I don't know" and skip the LLM call entirely.
+            # (Opt-in: controlled by ANSWER_MIN_SCORE.)
+            if ANSWER_MIN_SCORE is not None and ranked[0][1] < ANSWER_MIN_SCORE:
+                print(f"[Relevance] top score {ranked[0][1]:.3f} < {ANSWER_MIN_SCORE} "
+                      f"— skipping LLM, returning 'I don't know'")
+                return NO_ANSWER_MESSAGE
 
             # ──────────────────────────────────────────────────────
             # STEP 3: FINAL — Google Gemini LLM Generation
             # ──────────────────────────────────────────────────────
             # Formats top-5 docs into context, builds prompt,
-            # calls gemini-1.5-flash, returns grounded answer
+            # calls Gemini, returns grounded answer
             print(f"\n[Gemini] Sending to Gemini LLM...")
             answer = generate_answer(user_query, top_5_docs)
 
@@ -180,7 +189,7 @@ class TwoStageRAGPipeline:
 # Standalone Pipeline Execution (used by main.py)
 # ------------------------------------------------------------------
 
-def create_pipeline(file_paths: Optional[List[str]] = None) -> TwoStageRAGPipeline:
+def create_pipeline(file_paths: Optional[List[str]] = None, replace: bool = False) -> TwoStageRAGPipeline:
     """
     Create a fully initialized TwoStageRAGPipeline.
 
@@ -212,36 +221,29 @@ def create_pipeline(file_paths: Optional[List[str]] = None) -> TwoStageRAGPipeli
             + "=" * 60
         )
 
+    # Optionally ingest new documents first. replace=True clears the existing
+    # collection so a new document set isn't mixed with previously-ingested docs.
     if file_paths:
-        # Ingest new documents and build vector store
+        if replace:
+            print("\n[Pipeline] Replace mode: clearing existing collection...")
+            reset_vector_store()
         print("\n[Pipeline] Ingesting documents...")
-        chunks = ingest_documents(file_paths)
-
-        # Load the freshly built vector store
-        from ingest import load_vector_store
-        vector_store = load_vector_store()
+        ingest_documents(file_paths)
     else:
-        # Load existing ChromaDB (if already ingested)
         print("\n[Pipeline] Loading existing ChromaDB vector store...")
-        from ingest import load_vector_store
-        vector_store = load_vector_store()
 
-        # For BM25, we need the raw chunks from ChromaDB
-        # Reconstruct Document objects from stored data
-        collection = vector_store._collection
-        results = collection.get(include=["documents", "metadatas"])
-
-        chunks = [
-            Document(
-                page_content=text,
-                metadata=meta or {},
-            )
-            for text, meta in zip(
-                results["documents"],
-                results["metadatas"],
-            )
-        ]
-        print(f"  ✓ Loaded {len(chunks)} chunks from existing ChromaDB")
+    # Always (re)load the FULL persisted store and build the BM25 index over
+    # EVERY chunk. Previously, after an ingest BM25 indexed only the new docs —
+    # so keyword search silently lost previously-ingested documents until a
+    # restart. Rebuilding from the whole collection keeps both retrievers in sync.
+    vector_store = load_vector_store()
+    collection = vector_store._collection
+    results = collection.get(include=["documents", "metadatas"])
+    chunks = [
+        Document(page_content=text, metadata=meta or {})
+        for text, meta in zip(results["documents"], results["metadatas"])
+    ]
+    print(f"  ✓ Loaded {len(chunks)} chunks from ChromaDB (BM25 over full collection)")
 
     return TwoStageRAGPipeline(chunks, vector_store)
 

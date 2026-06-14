@@ -57,6 +57,13 @@ RETRY_BACKOFF = [5, 15, 30]             # Seconds to wait between retries
 # (e.g. 503 "model is currently experiencing high demand")
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
+# Optional relevance gate: if the best reranked score is below this, skip the LLM
+# and return NO_ANSWER_MESSAGE instead of risking a hallucinated answer. Off by
+# default; enable via the ANSWER_MIN_SCORE env var. Pairs with RERANK_MIN_SCORE.
+_ANSWER_MIN = os.getenv("ANSWER_MIN_SCORE")
+ANSWER_MIN_SCORE = float(_ANSWER_MIN) if _ANSWER_MIN not in (None, "") else None
+NO_ANSWER_MESSAGE = "I don't know based on the provided documents."
+
 # ------------------------------------------------------------------
 # Prompt Template
 # ------------------------------------------------------------------
