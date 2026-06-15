@@ -1,5 +1,11 @@
 # PDF RAG Extraction System
 
+> ℹ️ This README documents **System 1** (`pdf_rag/` + `run_rag.py`, OpenAI + FAISS).
+> The repo also contains **System 2** (`two_stage_rag/`, Gemini + web UI — the actively
+> developed one). For the full picture see **[PROJECT_DETAILS.md](PROJECT_DETAILS.md)**,
+> **[CODE_EXPLAINED.md](CODE_EXPLAINED.md)**, and **[RUN_GUIDE.md](RUN_GUIDE.md)**.
+> Note: System 1 currently needs an `openai>=1.0` SDK fix before it runs (see PROJECT_DETAILS).
+
 This project implements a two-stage retrieval-augmented generation (RAG) pipeline for extracting answers from PDF documents.
 
 ## What it does

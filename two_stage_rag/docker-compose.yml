@@ -1,0 +1,28 @@
+# Two-Stage RAG — one-command local stack:
+#
+#   cd two_stage_rag && docker compose up --build
+#   # then open http://localhost:3001
+#
+# Requires two_stage_rag/.env with GOOGLE_API_KEY (copy from .env.example).
+# Any optional knobs in .env (API_KEY, RERANK_MIN_SCORE, ANSWER_MIN_SCORE,
+# MAX_UPLOAD_MB, MAX_UPLOAD_FILES) are passed through to the api service.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file: .env
+    ports:
+      - "8000:8000"
+
+  proxy:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      - NODE_PORT=3001
+      - PYTHON_API_URL=http://api:8000
+    ports:
+      - "3001:3001"
+    depends_on:
+      - api

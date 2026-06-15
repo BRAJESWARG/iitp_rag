@@ -14,13 +14,14 @@ Run with:
 
 import os
 import sys
+import asyncio
 import shutil
 import tempfile
-import traceback
+import logging
 from typing import Optional, List
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -28,6 +29,26 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+# ── Logging (timestamped, leveled) ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("two_stage_rag.api")
+
+# ── API hardening (all opt-in via env) ──
+API_KEY = os.getenv("API_KEY")                       # if set, require X-API-Key header
+MAX_UPLOAD_FILES = int(os.getenv("MAX_UPLOAD_FILES", "10"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def require_api_key(x_api_key: Optional[str] = Header(None)):
+    """If API_KEY is configured, require a matching X-API-Key header (else open)."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
 
 # ──────────────────────────────────────────────────────────────
 # FastAPI App
@@ -38,10 +59,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Allow all origins for local development (tighten in production)
+# Explicit dev origins. Using "*" together with allow_credentials=True is invalid
+# (browsers reject it) and insecure — list the frontend/proxy origins instead.
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",  # Vite dev server
+    "http://localhost:3000",
+    "http://localhost:3001",  # Node proxy (serves the built UI)
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -132,10 +159,10 @@ def _try_load_existing_pipeline():
 
         pipeline_state["started_at"] = datetime.now().isoformat()
         pipeline_state["error"] = None
-        print("✓ Existing pipeline loaded from ChromaDB on startup")
+        logger.info("Existing pipeline loaded from ChromaDB on startup")
     except Exception as e:
         pipeline_state["error"] = str(e)
-        print(f"⚠ Could not auto-load pipeline: {e}")
+        logger.warning("Could not auto-load pipeline: %s", e)
     finally:
         pipeline_state["initializing"] = False
 
@@ -147,9 +174,7 @@ def _try_load_existing_pipeline():
 @app.on_event("startup")
 async def startup_event():
     """Try to load an existing pipeline when the server starts."""
-    print("=" * 55)
-    print(" Two-Stage RAG API starting up...")
-    print("=" * 55)
+    logger.info("Two-Stage RAG API starting up...")
     _try_load_existing_pipeline()
 
 
@@ -177,20 +202,23 @@ def get_status():
     )
 
 
-@app.post("/api/ingest", response_model=IngestResponse)
-async def ingest_documents(files: List[UploadFile] = File(...)):
+@app.post("/api/ingest", response_model=IngestResponse, dependencies=[Depends(require_api_key)])
+async def ingest_documents(files: List[UploadFile] = File(...), replace: bool = Form(False)):
     """
     Ingest one or more PDF or TXT documents into the RAG system.
     Accepts multipart/form-data with one or more file fields.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {MAX_UPLOAD_FILES}).")
 
     saved_paths = []
     tmp_dir = tempfile.mkdtemp()
+    total_bytes = 0
 
     try:
-        # Save uploaded files to a temp directory
+        # Save uploaded files to a temp directory (enforcing the size cap)
         for upload in files:
             ext = os.path.splitext(upload.filename)[1].lower()
             if ext not in (".pdf", ".txt"):
@@ -198,9 +226,15 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
                     status_code=400,
                     detail=f"Unsupported file type: {upload.filename}. Only PDF and TXT allowed."
                 )
+            content = await upload.read()
+            total_bytes += len(content)
+            if total_bytes > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload too large (max {MAX_UPLOAD_MB} MB total)."
+                )
             dest = os.path.join(tmp_dir, upload.filename)
             with open(dest, "wb") as f:
-                content = await upload.read()
                 f.write(content)
             saved_paths.append(dest)
 
@@ -208,23 +242,30 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
         pipeline_state["initializing"] = True
         from pipeline import create_pipeline
 
-        p = create_pipeline(file_paths=saved_paths)
+        p = create_pipeline(file_paths=saved_paths, replace=replace)
         pipeline_state["pipeline"] = p
         pipeline_state["initialized"] = True
         pipeline_state["chunks_count"] = len(p.chunks)
-        pipeline_state["documents_loaded"] = [
-            os.path.basename(path) for path in saved_paths
-        ]
+        # Reflect ALL documents currently in the store, not just this upload
+        loaded = set()
+        for doc in p.chunks:
+            src = doc.metadata.get("source")
+            if src:
+                loaded.add(os.path.basename(src))
+        pipeline_state["documents_loaded"] = sorted(loaded)
         pipeline_state["started_at"] = datetime.now().isoformat()
         pipeline_state["error"] = None
 
         return IngestResponse(
             success=True,
             message=f"Successfully ingested {len(saved_paths)} document(s).",
-            files_ingested=[os.path.basename(p) for p in saved_paths],
-            total_chunks=len(pipeline_state["pipeline"].chunks),
+            files_ingested=[os.path.basename(path) for path in saved_paths],
+            total_chunks=len(p.chunks),
         )
 
+    except HTTPException:
+        # Validation errors (size / count / type / auth) keep their status code
+        raise
     except Exception as e:
         pipeline_state["error"] = str(e)
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
@@ -233,7 +274,7 @@ async def ingest_documents(files: List[UploadFile] = File(...)):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-@app.post("/api/query", response_model=QueryResponse)
+@app.post("/api/query", response_model=QueryResponse, dependencies=[Depends(require_api_key)])
 async def run_query(request: QueryRequest):
     """
     Run a full two-stage RAG query and return the answer with metadata.
@@ -256,23 +297,26 @@ async def run_query(request: QueryRequest):
         p = pipeline_state["pipeline"]
         query = request.query.strip()
 
+        # All three stages are blocking (CPU + network); run them in worker
+        # threads so the asyncio event loop stays responsive under concurrency.
+
         # Stage 1: Hybrid Search
         from retriever import hybrid_search
-        candidates = hybrid_search(p.retriever, query)
+        candidates = await asyncio.to_thread(hybrid_search, p.retriever, query)
         stage1_count = len(candidates)
 
-        # Stage 2: Cross Encoder Reranking
-        from reranker import cross_encoder_rerank, get_reranker
-        top_docs = cross_encoder_rerank(query, candidates)
+        # Stage 2: Cross Encoder Reranking (docs + scores in a single pass)
+        from reranker import cross_encoder_rerank_with_scores
+        ranked = await asyncio.to_thread(cross_encoder_rerank_with_scores, query, candidates)
+        top_docs = [doc for doc, _ in ranked]
+        scores = [score for _, score in ranked]
 
-        # Compute scores for the top docs
-        reranker = get_reranker()
-        pairs = [[query, doc.page_content] for doc in top_docs]
-        scores = reranker.model.predict(pairs).tolist()
-
-        # Final: Gemini LLM
-        from llm import generate_answer, GEMINI_MODEL
-        answer = generate_answer(query, top_docs)
+        # Final: Gemini LLM — but skip it if nothing is relevant enough
+        from llm import generate_answer, GEMINI_MODEL, ANSWER_MIN_SCORE, NO_ANSWER_MESSAGE
+        if ANSWER_MIN_SCORE is not None and scores and max(scores) < ANSWER_MIN_SCORE:
+            answer = NO_ANSWER_MESSAGE
+        else:
+            answer = await asyncio.to_thread(generate_answer, query, top_docs)
 
         duration_ms = (time.time() - start_time) * 1000
 
@@ -288,7 +332,7 @@ async def run_query(request: QueryRequest):
         )
 
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("Query failed")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
@@ -300,6 +344,13 @@ async def websocket_query(websocket: WebSocket):
     Sends stages, text chunks, and completion results.
     """
     await websocket.accept()
+    # Optional API-key gate (matches the HTTP endpoints)
+    if API_KEY:
+        provided = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+        if provided != API_KEY:
+            await websocket.send_json({"type": "error", "message": "Invalid or missing API key."})
+            await websocket.close(code=1008)
+            return
     try:
         while True:
             # Receive input from client
@@ -327,8 +378,9 @@ async def websocket_query(websocket: WebSocket):
             await websocket.send_json({"type": "stage", "stage": "stage1_searching"})
             
             from retriever import hybrid_search
-            # Non-blocking search execution
-            candidates = hybrid_search(p.retriever, query)
+            # Run blocking retrieval in a worker thread so the event loop stays
+            # responsive and the WebSocket keepalive isn't starved on slow queries.
+            candidates = await asyncio.to_thread(hybrid_search, p.retriever, query)
             stage1_count = len(candidates)
 
             if not candidates:
@@ -347,8 +399,10 @@ async def websocket_query(websocket: WebSocket):
                 "stage1_candidates": stage1_count
             })
             
-            from reranker import cross_encoder_rerank, get_reranker
-            top_docs = cross_encoder_rerank(query, candidates)
+            from reranker import cross_encoder_rerank_with_scores
+            ranked = await asyncio.to_thread(cross_encoder_rerank_with_scores, query, candidates)
+            top_docs = [doc for doc, _ in ranked]
+            scores = [score for _, score in ranked]
             stage2_count = len(top_docs)
 
             if not top_docs:
@@ -358,10 +412,6 @@ async def websocket_query(websocket: WebSocket):
                 })
                 continue
 
-            # Compute scores for the top docs
-            reranker = get_reranker()
-            pairs = [[query, doc.page_content] for doc in top_docs]
-            scores = reranker.model.predict(pairs).tolist()
             snippets = [doc.page_content[:200] for doc in top_docs]
 
             # ──────────────────────────────────────────────────────
@@ -375,14 +425,25 @@ async def websocket_query(websocket: WebSocket):
                 "top_doc_snippets": snippets
             })
 
-            # Stream Gemini answer chunk-by-chunk
-            from llm import generate_answer_stream, GEMINI_MODEL
-            
-            for text_chunk in generate_answer_stream(query, top_docs):
-                await websocket.send_json({
-                    "type": "chunk",
-                    "text": text_chunk
-                })
+            # Stream Gemini answer chunk-by-chunk. The generator blocks on each
+            # network read, so pull each chunk in a worker thread to keep the
+            # event loop (and WebSocket keepalive) responsive between chunks.
+            from llm import generate_answer_stream, GEMINI_MODEL, ANSWER_MIN_SCORE, NO_ANSWER_MESSAGE
+
+            if ANSWER_MIN_SCORE is not None and scores and max(scores) < ANSWER_MIN_SCORE:
+                # Nothing relevant enough — skip the LLM and say so.
+                await websocket.send_json({"type": "chunk", "text": NO_ANSWER_MESSAGE})
+            else:
+                gen = generate_answer_stream(query, top_docs)
+                _SENTINEL = object()
+                while True:
+                    text_chunk = await asyncio.to_thread(next, gen, _SENTINEL)
+                    if text_chunk is _SENTINEL:
+                        break
+                    await websocket.send_json({
+                        "type": "chunk",
+                        "text": text_chunk
+                    })
 
             duration_ms = (time.time() - start_time) * 1000
 
@@ -394,9 +455,9 @@ async def websocket_query(websocket: WebSocket):
             })
 
     except WebSocketDisconnect:
-        print("✓ WebSocket client disconnected")
+        logger.info("WebSocket client disconnected")
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("WebSocket pipeline query failed")
         try:
             await websocket.send_json({"type": "error", "message": f"Pipeline Query failed: {str(e)}"})
         except Exception:

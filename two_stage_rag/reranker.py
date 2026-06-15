@@ -30,6 +30,7 @@ Usage:
     top5 = reranker.rerank(query, candidates_100)
 """
 
+import os
 from typing import List, Tuple
 
 from langchain_core.documents import Document
@@ -40,6 +41,14 @@ from sentence_transformers import CrossEncoder
 # ------------------------------------------------------------------
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 TOP_K_RERANKED = 5   # How many documents to keep after reranking
+
+# Optional minimum cross-encoder relevance score, used to drop clearly-irrelevant
+# chunks before they reach the LLM. NOTE: cross-encoder logits are NOT normalized
+# across queries (a genuinely relevant chunk can still score negative), so this is
+# DISABLED by default. Enable/tune it for your corpus via the env var, e.g.:
+#   RERANK_MIN_SCORE=0
+_MIN_SCORE_ENV = os.getenv("RERANK_MIN_SCORE")
+RERANK_MIN_SCORE = float(_MIN_SCORE_ENV) if _MIN_SCORE_ENV not in (None, "") else None
 
 
 class CrossEncoderReranker:
@@ -67,28 +76,27 @@ class CrossEncoderReranker:
         # CrossEncoder downloads and caches the model on first run
         self.model = CrossEncoder(model_name)
         self.top_k = TOP_K_RERANKED
+        self.min_score = RERANK_MIN_SCORE
         print(f"  ✓ Cross Encoder loaded successfully")
 
-    def rerank(
+    def rerank_with_scores(
         self,
         query: str,
         candidates: List[Document],
-    ) -> List[Document]:
+    ) -> List[Tuple[Document, float]]:
         """
-        Rerank candidate documents using the Cross Encoder.
+        Rerank candidates and return (Document, score) pairs, highest first.
 
-        For each candidate document:
-          score = cross_encoder.predict([query, doc.page_content])
-
-        This computes a relevance score by jointly encoding the query
-        and document, enabling fine-grained matching.
+        For each candidate: score = cross_encoder.predict([query, doc]).
+        Keeps the top-k, then applies the optional RERANK_MIN_SCORE threshold
+        (always keeping at least the single best document).
 
         Args:
             query: The user's query string.
-            candidates: List of 100 candidate Document objects from Stage 1.
+            candidates: Candidate Document objects from Stage 1.
 
         Returns:
-            Top-5 Document objects sorted by relevance score (highest first).
+            List of (Document, score) tuples sorted by relevance (highest first).
         """
         if not candidates:
             print("  [WARNING] No candidates to rerank.")
@@ -96,37 +104,49 @@ class CrossEncoderReranker:
 
         print(f"\n[Stage 2] Cross Encoder Reranking {len(candidates)} candidates...")
 
-        # Build list of [query, document_text] pairs for batch prediction
-        # Cross encoder needs BOTH query and document in a single input
-        query_doc_pairs = [
-            [query, doc.page_content]
-            for doc in candidates
-        ]
-
-        # Batch predict relevance scores for all pairs simultaneously
-        # Returns a numpy array of float scores (higher = more relevant)
+        # Cross encoder needs BOTH query and document in a single input.
+        # Batch-predict relevance scores for all pairs at once.
+        query_doc_pairs = [[query, doc.page_content] for doc in candidates]
         scores = self.model.predict(query_doc_pairs)
 
-        # Pair each document with its relevance score
-        scored_docs: List[Tuple[Document, float]] = list(
-            zip(candidates, scores)
+        # Pair docs with scores and sort descending (highest relevance first)
+        scored_docs: List[Tuple[Document, float]] = sorted(
+            zip(candidates, (float(s) for s in scores)),
+            key=lambda x: x[1],
+            reverse=True,
         )
 
-        # Sort by score in DESCENDING order (highest relevance first)
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        top = scored_docs[: self.top_k]
 
-        # Extract top-k documents after reranking
-        top_docs = [doc for doc, score in scored_docs[: self.top_k]]
+        # Optional relevance threshold — drop clearly-irrelevant docs, but always
+        # keep at least the best one so the LLM still has context to ground on.
+        if self.min_score is not None:
+            filtered = [(d, s) for d, s in top if s >= self.min_score]
+            if filtered:
+                if len(filtered) < len(top):
+                    print(f"  [Stage 2] Threshold {self.min_score}: "
+                          f"kept {len(filtered)}/{len(top)} docs")
+                top = filtered
+            else:
+                print(f"  [Stage 2] All docs below threshold {self.min_score}; "
+                      f"keeping top 1")
+                top = top[:1]
 
         # Print scores for transparency
-        print(f"  [Stage 2] Reranked to Top {self.top_k} using Cross Encoder")
-        print(f"  Top {self.top_k} relevance scores:")
-        for i, (doc, score) in enumerate(scored_docs[: self.top_k], 1):
-            # Show a snippet of each top doc for visibility
+        print(f"  [Stage 2] Reranked to Top {len(top)} using Cross Encoder")
+        for i, (doc, score) in enumerate(top, 1):
             snippet = doc.page_content[:80].replace("\n", " ")
             print(f"    {i}. Score={score:.4f} | '{snippet}...'")
 
-        return top_docs
+        return top
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[Document],
+    ) -> List[Document]:
+        """Back-compatible wrapper: return just the reranked Documents."""
+        return [doc for doc, _ in self.rerank_with_scores(query, candidates)]
 
 
 # ------------------------------------------------------------------
@@ -158,7 +178,20 @@ def cross_encoder_rerank(
         candidates: List of candidate Documents from Stage 1.
 
     Returns:
-        Top-5 reranked Document objects.
+        Reranked Document objects (top-k, optionally score-filtered).
     """
-    reranker = get_reranker()
-    return reranker.rerank(query, candidates)
+    return get_reranker().rerank(query, candidates)
+
+
+def cross_encoder_rerank_with_scores(
+    query: str,
+    candidates: List[Document],
+) -> List[Tuple[Document, float]]:
+    """
+    Like cross_encoder_rerank but also returns each document's relevance score,
+    so callers don't need to run the cross encoder a second time.
+
+    Returns:
+        List of (Document, score) tuples sorted by relevance (highest first).
+    """
+    return get_reranker().rerank_with_scores(query, candidates)

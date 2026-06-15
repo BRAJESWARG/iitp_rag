@@ -13,6 +13,7 @@ Usage:
 """
 
 import os
+import re
 from typing import List
 
 from langchain_core.documents import Document
@@ -30,6 +31,18 @@ CHUNK_OVERLAP = 50        # Overlap between consecutive chunks
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # Bi-Encoder for vector store
 CHROMA_PERSIST_DIR = "./chroma_db"      # Where ChromaDB data is saved
 COLLECTION_NAME = "two_stage_rag"       # ChromaDB collection name
+
+
+def _normalize_text(text: str) -> str:
+    """
+    Collapse common extraction artifacts so chunking/retrieval behave better:
+    non-breaking spaces, runs of spaces/tabs (e.g. "Acme  Technologies"), and
+    3+ consecutive blank lines. Paragraph breaks are preserved.
+    """
+    text = text.replace(" ", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def load_documents(file_paths: List[str]) -> List[Document]:
@@ -65,6 +78,9 @@ def load_documents(file_paths: List[str]) -> List[Document]:
             continue
 
         docs = loader.load()
+        # Normalize whitespace artifacts from PDF/DOCX extraction before chunking
+        for d in docs:
+            d.page_content = _normalize_text(d.page_content)
         all_docs.extend(docs)
         print(f"  ✓ Loaded {len(docs)} page(s) from {os.path.basename(path)}")
 
@@ -214,3 +230,18 @@ def load_vector_store() -> Chroma:
     )
 
     return vector_store
+
+
+def reset_vector_store() -> None:
+    """
+    Delete the persisted ChromaDB collection. Used by replace-mode ingestion so
+    a new document set isn't mixed with previously-ingested documents.
+    """
+    if not os.path.exists(CHROMA_PERSIST_DIR):
+        return
+    try:
+        vs = load_vector_store()
+        vs.delete_collection()
+        print(f"  ✓ Cleared existing collection '{COLLECTION_NAME}'")
+    except Exception as e:
+        print(f"  [WARNING] Could not reset collection: {e}")

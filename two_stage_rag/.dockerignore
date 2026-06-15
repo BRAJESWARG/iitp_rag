@@ -1,0 +1,10 @@
+# Keep build contexts small and platform-clean (don't copy host-built artifacts)
+venv/
+**/__pycache__/
+*.pyc
+.env
+*.log
+backend/node_modules/
+backend/dist/
+frontend/node_modules/
+frontend/dist/

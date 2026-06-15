@@ -1,18 +1,22 @@
 # ============================================================
 # Requirements for Two-Stage RAG Pipeline
 # ============================================================
-# Install all dependencies with:
+# IMPORTANT — install CPU-only PyTorch FIRST, otherwise sentence-transformers
+# pulls the multi-GB CUDA build (this app runs on CPU). Then install this file:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   pip install -r requirements.txt
 # ============================================================
 
 # Core LangChain framework
 langchain>=0.1.0
 langchain-community>=0.0.20
+langchain-classic>=1.0.0        # EnsembleRetriever (split out of core langchain)
 langchain-google-genai>=0.0.6
 
 # Modern standalone integrations (preferred over langchain-community)
-langchain-huggingface>=0.0.3   # HuggingFaceEmbeddings
-langchain-chroma>=0.1.0        # ChromaDB vector store
+langchain-huggingface>=0.0.3    # HuggingFaceEmbeddings
+langchain-chroma>=0.1.0         # ChromaDB vector store
 
 # Vector Database
 chromadb>=0.4.22
@@ -23,11 +27,17 @@ sentence-transformers>=2.3.1
 # BM25 keyword-based retrieval
 rank-bm25>=0.2.2
 
-# Google Gemini LLM
-google-generativeai>=0.4.0
+# Google Gemini LLM — llm.py uses the modern google-genai SDK
+google-genai>=1.0.0
+google-generativeai>=0.4.0      # (also pulled in by langchain-google-genai)
 
 # PDF document loading
 pypdf>=4.0.0
+
+# Web backend (api.py)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0       # ASGI server (+ websockets, uvloop, httptools)
+python-multipart>=0.0.9         # required for /api/ingest file uploads
 
 # Environment variable management
 python-dotenv>=1.0.0
