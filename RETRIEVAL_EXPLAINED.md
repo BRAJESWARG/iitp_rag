@@ -133,10 +133,13 @@ Query: **"How does keyword-based document ranking work?"** over `sample.txt`
 - Note we never compared `8.9` to `0.87` — only ranks.
 
 ### The script
+
+The runnable version ships at [`two_stage_rag/rrf_demo.py`](two_stage_rag/rrf_demo.py) —
+run it from `two_stage_rag/` with `venv/bin/python rrf_demo.py [--query "..."] [--top N]`.
+Abbreviated source:
+
 ```python
-"""Show BM25 rank vs vector rank vs fused RRF score for one query.
-Run from two_stage_rag/:  PYTHONPATH=. venv/bin/python rrf_demo.py
-"""
+"""Show BM25 rank vs vector rank vs fused RRF score for one query."""
 import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
